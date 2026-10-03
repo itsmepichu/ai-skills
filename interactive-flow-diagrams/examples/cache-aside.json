@@ -1,0 +1,90 @@
+// Cache-aside read path: the smallest useful flowfig diagram.
+// Build:  node scripts/build.mjs examples/cache-aside.json
+{
+  "title": "Cache-aside read path",
+  "subtitle": "GET /users/42 through an API with Redis in front of Postgres",
+  "theme": "auto",
+  "layout": {
+    "gap": 64,
+    "children": [
+      { "id": "client", "label": "Web app", "kind": "browser", "sub": "React SPA" },
+      { "label": "API tier", "kind": "network", "direction": "column", "gap": 40, "children": [
+        { "id": "api", "label": "Users API", "kind": "api", "sub": "GET /users/:id", "stack": true },
+        { "id": "auth", "label": "Auth", "kind": "auth", "sub": "JWT check" }
+      ]},
+      { "label": "Data tier", "direction": "column", "gap": 32, "children": [
+        { "id": "cache", "label": "Cache", "kind": "cache", "sub": "Redis" },
+        { "id": "db", "label": "Database", "kind": "database", "sub": "Postgres" }
+      ]}
+    ]
+  },
+  "edges": [
+    { "id": "req", "from": "client", "to": "api", "label": "HTTPS" },
+    { "id": "verify", "from": "api", "to": "auth", "label": "verify" },
+    { "id": "cache", "from": "api", "to": "cache", "label": "GET / SET" },
+    { "id": "sql", "from": "api", "to": "db", "label": "SQL" }
+  ],
+  "scenarios": [
+    {
+      "label": "cache miss",
+      "caption": "First request for a user that is not cached yet.",
+      "flow": [
+        { "edges": { "edge": "req", "data": "GET /users/42" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }] },
+          "say": "The web app asks the API for user 42." },
+        { "edges": { "edge": "verify", "data": "Bearer eyJhb…" },
+          "show": { "auth": [{ "text": "token valid", "mark": "✓" }] },
+          "say": "The API checks the token before doing any work." },
+        { "edges": { "edge": "cache", "data": "GET user:42" },
+          "show": { "cache": [{ "tag": "miss", "tone": "orange", "text": "user:42" }] },
+          "say": "It looks in Redis first. Nothing there: a **cache miss**." },
+        { "edges": { "edge": "sql", "data": "SELECT … WHERE id = 42" },
+          "show": { "db": [{ "tag": "row", "tone": "blue", "text": "Alice" }, { "text": "query", "meta": "18 ms" }] },
+          "say": "So it falls back to Postgres, which is slower.", "ms": 2600 },
+        { "edges": { "edge": "sql", "back": true, "data": "1 row" }, "ms": 1500 },
+        { "edges": { "edge": "cache", "data": "SET user:42 EX 60" },
+          "show": { "cache": [{ "tag": "saved", "tone": "green", "text": "user:42", "meta": "TTL 60s" }] },
+          "say": "The API writes the row to Redis with a 60 second TTL." },
+        { "edges": { "edge": "req", "back": true, "data": "200 OK" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }, { "tag": "200", "tone": "green", "text": "Alice", "meta": "24 ms" }] },
+          "say": "The client gets its answer in **24 ms**." }
+      ]
+    },
+    {
+      "label": "cache hit",
+      "caption": "The same request a few seconds later.",
+      "flow": [
+        { "edges": { "edge": "req", "data": "GET /users/42" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }] },
+          "say": "Same request, a few seconds later." },
+        { "edges": [{ "edge": "verify", "data": "Bearer eyJhb…" }, { "edge": "cache", "data": "GET user:42", "delay": 150 }],
+          "show": { "auth": [{ "text": "token valid", "mark": "✓" }], "cache": [{ "tag": "hit", "tone": "green", "text": "user:42", "meta": "TTL 52s", "mark": "✓" }] },
+          "say": "Two hops in one beat run in parallel. This time Redis has it.", "ms": 2600 },
+        { "edges": { "edge": "cache", "back": true, "data": "Alice" }, "ms": 1400 },
+        { "edges": { "edge": "req", "back": true, "data": "200 OK" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }, { "tag": "200", "tone": "green", "text": "Alice", "meta": "3 ms" }] },
+          "say": "No database trip, so the answer is **8× faster**." }
+      ]
+    },
+    {
+      "label": "redis down",
+      "caption": "What the user sees when the cache is unavailable.",
+      "flow": [
+        { "edges": { "edge": "req", "data": "GET /users/42" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }] },
+          "state": { "cache": "error" },
+          "say": "Redis has failed over and is refusing connections." },
+        { "edges": { "edge": "cache", "data": "GET user:42", "fail": true },
+          "show": { "cache": [{ "tag": "timeout", "tone": "red", "text": "50 ms budget exceeded" }] },
+          "say": "The cache call times out quickly - the client library has a 50 ms budget.", "ms": 2600 },
+        { "edges": { "edge": "sql", "data": "SELECT … WHERE id = 42", "tone": "warn" },
+          "show": { "db": [{ "tag": "row", "tone": "blue", "text": "Alice" }, { "text": "load", "meta": "+35%", "mark": "!", "markTone": "warn" }] },
+          "state": { "db": "warn" },
+          "say": "The API degrades gracefully to Postgres. Load rises, but requests still succeed." },
+        { "edges": { "edge": "req", "back": true, "data": "200 OK", "tone": "ok" },
+          "show": { "client": [{ "tag": "req", "tone": "gray", "text": "GET /users/42" }, { "tag": "200", "tone": "green", "text": "Alice", "meta": "71 ms" }] },
+          "say": "Slower, but no error reaches the user. Alert on the cache, not on the API." }
+      ]
+    }
+  ]
+}

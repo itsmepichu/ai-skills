@@ -1,0 +1,80 @@
+// Active-passive multi-region failover with DNS health checks and a global database.
+// Tip: swap built-in kinds for official provider icons, e.g.
+//   "icon": "iconify:logos:aws-route53"  then build with --fetch-icons
+{
+  "title": "Multi-region failover",
+  "subtitle": "Active-passive across two regions with DNS health checks",
+  "theme": { "mode": "auto" },
+  "beatMs": 2400,
+  "layout": {
+    "gap": 64,
+    "children": [
+      { "id": "users", "label": "Users", "kind": "users", "sub": "worldwide" },
+      { "id": "dns", "label": "DNS", "kind": "dns", "sub": "failover routing", "width": 190 },
+      { "direction": "column", "gap": 36, "children": [
+        { "id": "east", "label": "us-east-1 · primary", "kind": "region", "gap": 48, "children": [
+          { "id": "lb1", "label": "Load balancer", "kind": "lb" },
+          { "id": "app1", "label": "App", "kind": "cluster", "sub": "3 × pods", "stack": true },
+          { "id": "db1", "label": "Database", "kind": "database", "sub": "writer", "width": 170 }
+        ]},
+        { "id": "west", "label": "eu-west-1 · standby", "kind": "region", "style": "dashed", "gap": 48, "children": [
+          { "id": "lb2", "label": "Load balancer", "kind": "lb" },
+          { "id": "app2", "label": "App", "kind": "cluster", "sub": "warm standby", "stack": true },
+          { "id": "db2", "label": "Database", "kind": "database", "sub": "read replica", "width": 170 }
+        ]}
+      ]}
+    ]
+  },
+  "edges": [
+    { "id": "resolve", "from": "users", "to": "dns", "label": "resolve" },
+    { "id": "r1", "from": "dns", "to": "lb1" },
+    { "id": "r2", "from": "dns", "to": "lb2" },
+    { "id": "a1", "from": "lb1", "to": "app1" },
+    { "id": "d1", "from": "app1", "to": "db1" },
+    { "id": "a2", "from": "lb2", "to": "app2" },
+    { "id": "d2", "from": "app2", "to": "db2" },
+    { "id": "repl", "from": "db1", "to": "db2", "style": "stream", "label": "async replication" }
+  ],
+  "scenarios": [
+    {
+      "label": "normal",
+      "caption": "Everything is healthy. All traffic goes to us-east-1.",
+      "flow": [
+        { "edges": { "edge": "resolve", "data": "app.example.com?" },
+          "show": { "dns": [{ "tag": "A", "tone": "blue", "text": "us-east-1 LB", "meta": "TTL 60s" }] },
+          "say": "Users resolve the app's hostname. DNS answers with the primary region." },
+        { "edges": [{ "edge": "r1", "data": "HTTPS" }, { "edge": "a1", "delay": 1000 }],
+          "say": "Requests reach the load balancer and the app pods in us-east-1.", "ms": 2800 },
+        { "edges": { "edge": "d1", "data": "INSERT order" },
+          "show": { "db1": [{ "tag": "writer", "tone": "green", "text": "commit", "meta": "4 ms" }] },
+          "say": "Writes land on the primary database." },
+        { "edges": { "edge": "repl", "data": "WAL stream" },
+          "show": { "db2": [{ "tag": "lag", "tone": "gray", "text": "replica", "meta": "< 1 s" }] },
+          "say": "Changes stream continuously to the standby region, usually under a second behind." }
+      ]
+    },
+    {
+      "label": "region outage",
+      "caption": "us-east-1 loses its application tier.",
+      "flow": [
+        { "state": { "app1": "error", "lb1": "warn" },
+          "show": { "db1": [{ "tag": "writer", "tone": "orange", "text": "unreachable" }] },
+          "light": ["east"],
+          "say": "A regional incident takes down the primary app tier.", "ms": 2000 },
+        { "edges": { "edge": "r1", "data": "health check", "fail": true },
+          "show": { "dns": [{ "tag": "check", "tone": "red", "text": "us-east-1", "meta": "3 failures" }] },
+          "say": "DNS health checks against us-east-1 start failing.", "ms": 2600 },
+        { "show": { "dns": [{ "tag": "A", "tone": "orange", "text": "eu-west-1 LB", "meta": "failover" }], "db2": [{ "tag": "promote", "tone": "orange", "text": "replica → writer" }] },
+          "state": { "db2": "warn" },
+          "light": ["dns", "db2"],
+          "say": "After 3 failures (~30 s) DNS answers with the standby region, and the replica is promoted to writer.", "ms": 3000 },
+        { "edges": [{ "edge": "resolve", "data": "app.example.com?" }, { "edge": "r2", "data": "HTTPS", "delay": 1100 }],
+          "say": "New lookups get the standby region once the 60 s TTL expires.", "ms": 3000 },
+        { "edges": [{ "edge": "a2", "data": "POST /orders" }, { "edge": "d2", "data": "INSERT order", "delay": 900 }],
+          "state": { "db2": "ok", "app2": "ok" },
+          "show": { "db2": [{ "tag": "writer", "tone": "green", "text": "commit", "meta": "5 ms" }] },
+          "say": "Traffic is served from eu-west-1. **RTO** ≈ detection + TTL + promotion; **RPO** ≈ replication lag.", "ms": 3200 }
+      ]
+    }
+  ]
+}

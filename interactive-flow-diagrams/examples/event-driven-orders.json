@@ -1,0 +1,119 @@
+// Event-driven order pipeline: transactional outbox + Kafka fan-out + retries/DLQ.
+// Shows async edges, parallel hops with delays, failure hops, node states,
+// an edge routed around the bottom, and three scenarios.
+{
+  "title": "Order pipeline",
+  "subtitle": "Transactional outbox, Kafka fan-out, retries and a dead-letter queue",
+  "theme": "auto",
+  "beatMs": 2400,
+  "layout": {
+    "gap": 60,
+    "children": [
+      { "id": "customer", "label": "Customer", "kind": "user", "sub": "web checkout", "width": 200 },
+      { "id": "gateway", "label": "API Gateway", "kind": "gateway", "sub": "auth · rate limit" },
+      { "label": "Order domain", "direction": "column", "gap": 44, "children": [
+        { "id": "orders", "label": "Orders", "kind": "service", "sub": "POST /orders", "stack": true },
+        { "id": "ordersdb", "label": "Orders DB", "kind": "database", "sub": "orders + outbox" }
+      ]},
+      { "label": "Event backbone", "direction": "column", "gap": 44, "children": [
+        { "id": "topic", "label": "order-events", "kind": "stream", "sub": "Kafka topic", "width": 190 },
+        { "id": "dlq", "label": "DLQ", "kind": "queue", "sub": "retries exhausted", "width": 190 }
+      ]},
+      { "label": "Consumers", "direction": "column", "gap": 28, "children": [
+        { "id": "payments", "label": "Payments", "kind": "service", "sub": "charges cards" },
+        { "id": "inventory", "label": "Inventory", "kind": "service", "sub": "reserves stock" },
+        { "id": "notify", "label": "Notifications", "kind": "notification", "sub": "email · push" }
+      ]},
+      { "id": "stripe", "label": "Stripe", "kind": "payment", "sub": "external PSP", "style": "dashed" }
+    ]
+  },
+  "edges": [
+    { "id": "place", "from": "customer", "to": "gateway", "label": "HTTPS" },
+    { "id": "route", "from": "gateway", "to": "orders" },
+    { "id": "write", "from": "orders", "to": "ordersdb", "label": "1 tx" },
+    { "id": "relay", "from": "ordersdb", "to": "topic", "label": "outbox relay", "style": "async" },
+    { "id": "fan-pay", "from": "topic", "to": "payments", "style": "async" },
+    { "id": "fan-inv", "from": "topic", "to": "inventory", "style": "async" },
+    { "id": "fan-not", "from": "topic", "to": "notify", "style": "async" },
+    { "id": "pay-evt", "from": "payments", "to": "topic", "style": "async" },
+    { "id": "charge", "from": "payments", "to": "stripe", "label": "charge" },
+    { "id": "dlq", "from": "payments", "to": "dlq", "style": "async", "label": "after 3 tries", "labelAt": 0.7 },
+    { "id": "receipt", "from": "notify", "to": "customer", "around": "below", "style": "async", "label": "email", "quiet": true }
+  ],
+  "scenarios": [
+    {
+      "label": "happy path",
+      "caption": "A customer places an order.",
+      "flow": [
+        { "edges": { "edge": "place", "data": "POST /orders" },
+          "show": { "customer": [{ "tag": "cart", "tone": "gray", "text": "3 items", "meta": "$84.00" }] },
+          "say": "The customer checks out. The request enters through the API gateway." },
+        { "edges": { "edge": "route", "data": "POST /orders" },
+          "say": "The gateway authenticates the call and routes it to the Orders service." },
+        { "edges": { "edge": "write", "data": "INSERT order + outbox" },
+          "show": { "ordersdb": [{ "tag": "order", "text": "#1042", "meta": "PENDING" }, { "tag": "outbox", "tone": "orange", "text": "OrderPlaced #1042" }] },
+          "say": "Orders writes the order **and** an outbox row in one transaction, so no event is ever lost.", "ms": 2800 },
+        { "edges": [{ "edge": "route", "back": true, "data": "202 Accepted" }, { "edge": "place", "back": true, "data": "202 · order #1042", "delay": 1000 }],
+          "show": { "customer": [{ "tag": "cart", "tone": "gray", "text": "3 items", "meta": "$84.00" }, { "tag": "202", "tone": "green", "text": "order #1042 received" }] },
+          "say": "The customer gets a fast **202**. Everything else happens asynchronously.", "ms": 2800 },
+        { "edges": { "edge": "relay", "data": "OrderPlaced #1042" },
+          "show": { "topic": [{ "tag": "1042", "tone": "gray", "text": "OrderPlaced" }] },
+          "say": "A relay publishes the outbox row to the order-events topic." },
+        { "edges": [{ "edge": "fan-pay", "data": "OrderPlaced" }, { "edge": "fan-inv", "data": "OrderPlaced", "delay": 150 }, { "edge": "fan-not", "data": "OrderPlaced", "delay": 300 }],
+          "show": { "payments": [{ "text": "charge $84.00" }], "inventory": [{ "text": "reserved 3", "mark": "✓" }], "notify": [{ "text": "receipt queued" }] },
+          "say": "Three independent consumers react to the same event. Adding a fourth needs no change to Orders.", "ms": 3000 },
+        { "edges": { "edge": "charge", "data": "charge $84.00" },
+          "show": { "stripe": [{ "tag": "ch_3Q", "tone": "green", "text": "succeeded", "mark": "✓" }] },
+          "say": "Payments charges the card through Stripe." },
+        { "edges": [{ "edge": "pay-evt", "data": "PaymentSucceeded" }, { "edge": "receipt", "data": "Order confirmed ✉", "delay": 300 }],
+          "show": { "topic": [{ "tag": "1042", "tone": "gray", "text": "OrderPlaced" }, { "tag": "1043", "tone": "green", "text": "PaymentSucceeded" }],
+                    "customer": [{ "tag": "202", "tone": "green", "text": "order #1042 received" }, { "tag": "email", "tone": "blue", "text": "Order confirmed" }] },
+          "say": "It publishes PaymentSucceeded for shipping to pick up, and the customer gets a confirmation email.", "ms": 3200 }
+      ]
+    },
+    {
+      "label": "payment fails",
+      "caption": "The payment provider has an outage.",
+      "flow": [
+        { "edges": { "edge": "fan-pay", "data": "OrderPlaced #1044" },
+          "show": { "topic": [{ "tag": "1044", "tone": "gray", "text": "OrderPlaced" }], "payments": [{ "tag": "try", "tone": "gray", "text": "attempt 1" }] },
+          "say": "Payments picks up a new order event." },
+        { "edges": { "edge": "charge", "data": "charge $31.50", "fail": true },
+          "state": { "stripe": "error" },
+          "show": { "stripe": [{ "tag": "503", "tone": "red", "text": "unavailable" }] },
+          "say": "Stripe is returning 503s. The charge fails.", "ms": 2600 },
+        { "edges": { "edge": "charge", "data": "retry · backoff 2s → 8s", "fail": true },
+          "show": { "payments": [{ "tag": "try", "tone": "orange", "text": "attempt 3", "meta": "backoff" }] },
+          "say": "Payments retries with exponential backoff…", "ms": 2600 },
+        { "edges": { "edge": "dlq", "data": "OrderPlaced #1044", "tone": "warn" },
+          "state": { "payments": "warn" },
+          "show": { "dlq": [{ "tag": "dlq", "tone": "orange", "text": "#1044", "meta": "3 attempts" }] },
+          "say": "…then parks the message in a **dead-letter queue** instead of blocking the partition." },
+        { "edges": { "edge": "dlq", "back": true, "data": "replay #1044" },
+          "state": { "stripe": "ok", "payments": null },
+          "show": { "dlq": null, "payments": [{ "tag": "try", "tone": "gray", "text": "replayed" }] },
+          "say": "When Stripe recovers, an operator (or a scheduled job) replays the DLQ." },
+        { "edges": { "edge": "charge", "data": "charge $31.50", "tone": "ok" },
+          "show": { "stripe": [{ "tag": "ch_9X", "tone": "green", "text": "succeeded", "mark": "✓" }] },
+          "say": "The replay succeeds. No order was lost and the customer was never blocked." }
+      ]
+    },
+    {
+      "label": "consumer down",
+      "caption": "Inventory is being redeployed.",
+      "flow": [
+        { "state": { "inventory": "off" },
+          "edges": [{ "edge": "fan-pay", "data": "OrderPlaced" }, { "edge": "fan-not", "data": "OrderPlaced", "delay": 150 }],
+          "show": { "topic": [{ "tag": "lag", "tone": "orange", "text": "inventory", "meta": "1,204 msgs" }] },
+          "say": "Inventory's consumers are down during a deploy. Payments and notifications keep going." },
+        { "show": { "topic": [{ "tag": "lag", "tone": "orange", "text": "inventory", "meta": "3,871 msgs" }] },
+          "light": ["topic"],
+          "say": "Kafka keeps the events. Only lag grows; nothing is lost.", "ms": 2000 },
+        { "state": { "inventory": "ok" },
+          "edges": { "edge": "fan-inv", "data": "catch up 3,871 msgs", "tone": "ok" },
+          "show": { "topic": [{ "tag": "lag", "tone": "green", "text": "inventory", "meta": "0 msgs" }], "inventory": [{ "text": "caught up", "mark": "✓" }] },
+          "say": "Back online, it resumes from its last committed offset and catches up.", "ms": 2800 }
+      ]
+    }
+  ]
+}
